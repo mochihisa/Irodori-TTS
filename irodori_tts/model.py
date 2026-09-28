@@ -38,15 +38,20 @@ def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0) -> torch.Te
     freqs = 1.0 / (theta ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
     t = torch.arange(end, dtype=torch.float32)
     freqs = torch.outer(t, freqs)
-    return torch.complex(torch.cos(freqs), torch.sin(freqs))
+    return torch.stack((torch.cos(freqs), torch.sin(freqs)), dim=-1)
 
 
 def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
     # x: (B, S, H, Dh), Dh must be even.
-    x_ = torch.view_as_complex(x.float().reshape(*x.shape[:3], -1, 2))
-    x_ = x_ * freqs_cis[None, :, None, :]
-    x_ = torch.view_as_real(x_).reshape_as(x)
-    return x_.type_as(x)
+    x_pairs = x.float().reshape(*x.shape[:3], -1, 2)
+    x_real, x_imag = x_pairs.unbind(dim=-1)
+    cos = freqs_cis[None, :, None, :, 0]
+    sin = freqs_cis[None, :, None, :, 1]
+    rotated = torch.stack(
+        (x_real * cos - x_imag * sin, x_real * sin + x_imag * cos),
+        dim=-1,
+    )
+    return rotated.reshape_as(x).type_as(x)
 
 
 def get_timestep_embedding(timestep: torch.Tensor, dim: int) -> torch.Tensor:
@@ -647,9 +652,7 @@ class TextEncoder(nn.Module):
             for _ in range(layers)
         )
         self.head_dim = dim // heads
-        self.register_buffer(
-            "_freqs_cis_cache", torch.empty(0, 0, dtype=torch.complex64), persistent=False
-        )
+        self.register_buffer("_freqs_cis_cache", torch.empty(0, 0, 2), persistent=False)
 
     def _rope_freqs(self, seq_len: int, device: torch.device) -> torch.Tensor:
         cache = self._freqs_cis_cache
@@ -900,9 +903,7 @@ class ReferenceLatentEncoder(nn.Module):
             for _ in range(cfg.speaker_layers)
         )
         self.head_dim = cfg.speaker_dim // cfg.speaker_heads
-        self.register_buffer(
-            "_freqs_cis_cache", torch.empty(0, 0, dtype=torch.complex64), persistent=False
-        )
+        self.register_buffer("_freqs_cis_cache", torch.empty(0, 0, 2), persistent=False)
 
     def _rope_freqs(self, seq_len: int, device: torch.device) -> torch.Tensor:
         cache = self._freqs_cis_cache
@@ -1589,9 +1590,7 @@ class TextToLatentRFDiT(nn.Module):
         self.head_dim = cfg.model_dim // cfg.num_heads
         if self.head_dim % 2 != 0:
             raise ValueError("model head_dim must be even for RoPE")
-        self.register_buffer(
-            "_freqs_cis_cache", torch.empty(0, 0, dtype=torch.complex64), persistent=False
-        )
+        self.register_buffer("_freqs_cis_cache", torch.empty(0, 0, 2), persistent=False)
 
     def _add_meanflow_delta_condition(self) -> None:
         if self.delta_cond_module is not None:
