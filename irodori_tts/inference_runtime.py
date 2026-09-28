@@ -29,7 +29,7 @@ from .quantization import (
     parse_quantization_metadata,
     unflatten_quantized_state_dict,
 )
-from .rf import sample_euler_rf_cfg
+from .rf import RFVelocityFn, sample_euler_rf_cfg
 from .speaker_inversion import (
     load_speaker_inversion_payload,
     speaker_inversion_batch_tensors,
@@ -76,6 +76,16 @@ def resolve_runtime_device(device: str | torch.device) -> torch.device:
     raise ValueError(
         f"Unsupported inference device={resolved!s}. Expected one of: cpu, cuda, mps, xpu."
     )
+
+
+def _is_npu_model_device(device: str | torch.device) -> bool:
+    return str(device).strip().lower() == "npu"
+
+
+def _resolve_model_device(device: str | torch.device) -> torch.device:
+    if _is_npu_model_device(device):
+        return torch.device("cpu")
+    return resolve_runtime_device(device)
 
 
 def list_available_runtime_devices() -> list[str]:
@@ -196,6 +206,18 @@ class RuntimeKey:
     codec_deterministic_decode: bool = True
     compile_model: bool = False
     compile_dynamic: bool = False
+
+
+def _create_rf_velocity_fn(
+    *,
+    model: TextToLatentRFDiT,
+    model_device: str | torch.device,
+) -> RFVelocityFn | None:
+    if not _is_npu_model_device(model_device):
+        return None
+    from .openvino_backend import create_rf_dit_backend
+
+    return create_rf_dit_backend(model, device="NPU")
 
 
 @dataclass
@@ -603,13 +625,17 @@ class InferenceRuntime:
         default_text_max_len: int,
         default_caption_max_len: int,
         default_max_ref_seconds: float = _LEGACY_MAX_REF_SECONDS,
+        rf_velocity_fn: RFVelocityFn | None = None,
     ) -> None:
         self.key = key
-        self.model_device = resolve_runtime_device(key.model_device)
+        self.model_device = _resolve_model_device(key.model_device)
         self.codec_device = resolve_runtime_device(key.codec_device)
+        if _is_npu_model_device(key.model_device) and rf_velocity_fn is None:
+            raise ValueError("model_device='npu' requires an OpenVINO RF-DiT backend.")
         self.model_cfg = model_cfg
         self.train_cfg = train_cfg
         self.model = model
+        self.rf_velocity_fn = rf_velocity_fn
         self.tokenizer = tokenizer
         self.caption_tokenizer = caption_tokenizer
         self.codec = codec
@@ -623,7 +649,10 @@ class InferenceRuntime:
 
     @classmethod
     def from_key(cls, key: RuntimeKey) -> InferenceRuntime:
-        model_device = resolve_runtime_device(key.model_device)
+        npu_model = _is_npu_model_device(key.model_device)
+        if npu_model and key.compile_model:
+            raise ValueError("model_device='npu' cannot be combined with compile_model.")
+        model_device = _resolve_model_device(key.model_device)
         codec_device = resolve_runtime_device(key.codec_device)
         model_dtype = resolve_runtime_dtype(
             precision=key.model_precision,
@@ -643,6 +672,8 @@ class InferenceRuntime:
             model_cfg_dict,
             section="checkpoint model_config",
         )
+        if npu_model and str(model_cfg.flow_parameterization).strip().lower() != "rf_velocity":
+            raise ValueError("model_device='npu' currently supports RF checkpoints only.")
 
         model = TextToLatentRFDiT(
             model_cfg,
@@ -661,6 +692,10 @@ class InferenceRuntime:
             model,
             enabled=bool(key.compile_model),
             dynamic=bool(key.compile_dynamic),
+        )
+        rf_velocity_fn = _create_rf_velocity_fn(
+            model=model,
+            model_device=key.model_device,
         )
 
         text_tokenizer_source, text_tokenizer_is_local = _resolve_tokenizer_source(
@@ -739,6 +774,7 @@ class InferenceRuntime:
             default_text_max_len=default_text_max_len,
             default_caption_max_len=default_caption_max_len,
             default_max_ref_seconds=default_max_ref_seconds,
+            rf_velocity_fn=rf_velocity_fn,
         )
 
     def _resolve_lora_adapter_path(self, adapter_path: str | None) -> str | None:
@@ -1401,6 +1437,7 @@ class InferenceRuntime:
                     speaker_kv_min_t=speaker_kv_min_t,
                     t_schedule_mode=str(req.t_schedule_mode),
                     sway_coeff=float(req.sway_coeff),
+                    velocity_fn=self.rf_velocity_fn,
                 )
             stage_sec = _measure_end(self.model_device, t0)
             sample_stage = (
@@ -1495,6 +1532,7 @@ class InferenceRuntime:
         )
 
     def unload(self) -> None:
+        self.rf_velocity_fn = None
         del self.model
         del self.tokenizer
         del self.codec

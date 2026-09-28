@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Callable
 
 import torch
 
 from .model import TextToLatentRFDiT
 from .speaker_inversion import SPEAKER_INVERSION_UNCOND_MODES
+
+RFVelocityFn = Callable[..., torch.Tensor]
 
 
 def _make_rng(seed: int, device: torch.device) -> tuple[torch.Generator, torch.device]:
@@ -143,6 +146,7 @@ def sample_euler_rf_cfg(
     speaker_kv_min_t: float | None = None,
     t_schedule_mode: str = "linear",
     sway_coeff: float = -1.0,
+    velocity_fn: RFVelocityFn | None = None,
 ) -> torch.Tensor:
     """
     Euler sampling over RF ODE with text/reference/caption conditioning CFG.
@@ -152,6 +156,8 @@ def sample_euler_rf_cfg(
     """
     device = model.device
     dtype = model.dtype
+    if velocity_fn is None:
+        velocity_fn = model.forward_with_encoded_conditions
     batch_size = text_input_ids.shape[0]
     latent_dim = model.cfg.patched_latent_dim
 
@@ -466,7 +472,7 @@ def sample_euler_rf_cfg(
             if use_independent_cfg:
                 x_t_cfg = torch.cat([x_t] * cfg_batch_mult, dim=0).to(dtype)
                 tt_cfg = tt.repeat(cfg_batch_mult)
-                v_out = model.forward_with_encoded_conditions(
+                v_out = velocity_fn(
                     x_t=x_t_cfg,
                     t=tt_cfg,
                     text_state=independent_text_state,
@@ -482,7 +488,7 @@ def sample_euler_rf_cfg(
                 for name, chunk in zip(independent_names[1:], chunks[1:], strict=True):
                     v = v + cfg_scales[name] * (chunks[0] - chunk)
             else:
-                v_cond = model.forward_with_encoded_conditions(
+                v_cond = velocity_fn(
                     x_t=x_t.to(dtype),
                     t=tt,
                     text_state=text_state_cond,
@@ -502,7 +508,7 @@ def sample_euler_rf_cfg(
                                 "set matching text/speaker/caption scales or use --cfg-scale."
                             )
                     joint_scale = cfg_scales[enabled_cfg_names[0]]
-                    v_uncond_joint = model.forward_with_encoded_conditions(
+                    v_uncond_joint = velocity_fn(
                         x_t=x_t.to(dtype),
                         t=tt,
                         text_state=joint_uncond_bundle[0],
@@ -517,7 +523,7 @@ def sample_euler_rf_cfg(
                 elif use_alternating_cfg:
                     alt_name = enabled_cfg_names[i % len(enabled_cfg_names)]
                     alt_bundle = alternating_bundles[alt_name]
-                    v_uncond_alt = model.forward_with_encoded_conditions(
+                    v_uncond_alt = velocity_fn(
                         x_t=x_t.to(dtype),
                         t=tt,
                         text_state=alt_bundle[0],
@@ -532,7 +538,7 @@ def sample_euler_rf_cfg(
                 else:
                     raise RuntimeError(f"Unexpected cfg_guidance_mode: {cfg_guidance_mode}")
         else:
-            v = model.forward_with_encoded_conditions(
+            v = velocity_fn(
                 x_t=x_t.to(dtype),
                 t=tt,
                 text_state=text_state_cond,

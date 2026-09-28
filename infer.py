@@ -92,7 +92,7 @@ def main() -> None:
     parser.add_argument(
         "--model-device",
         default=default_runtime_device(),
-        help="Model inference device (e.g. cuda, mps, cpu).",
+        help="Model inference target (e.g. cuda, xpu, mps, cpu, or experimental npu).",
     )
     parser.add_argument(
         "--model-precision",
