@@ -212,12 +212,17 @@ def _create_rf_velocity_fn(
     *,
     model: TextToLatentRFDiT,
     model_device: str | torch.device,
+    checkpoint_path: str | Path,
 ) -> RFVelocityFn | None:
     if not _is_npu_model_device(model_device):
         return None
     from .openvino_backend import create_rf_dit_backend
 
-    return create_rf_dit_backend(model, device="NPU")
+    return create_rf_dit_backend(
+        model,
+        device="NPU",
+        checkpoint_path=checkpoint_path,
+    )
 
 
 @dataclass
@@ -696,6 +701,7 @@ class InferenceRuntime:
         rf_velocity_fn = _create_rf_velocity_fn(
             model=model,
             model_device=key.model_device,
+            checkpoint_path=checkpoint_path,
         )
 
         text_tokenizer_source, text_tokenizer_is_local = _resolve_tokenizer_source(
