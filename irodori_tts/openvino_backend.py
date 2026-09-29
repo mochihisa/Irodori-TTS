@@ -2,13 +2,13 @@ from __future__ import annotations
 
 import os
 import warnings
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 import torch
 
 from .model import TextToLatentRFDiT, precompute_freqs_cis
-from .rf import RFVelocityFn
 
 _IR_CACHE_VERSION = 1
 _MAX_DYNAMIC_SEQUENCE_LENGTH = 4096
@@ -52,7 +52,40 @@ class _RFDiTExportWrapper(torch.nn.Module):
         )
 
 
-class OpenVINORFDiTBackend:
+class _MeanFlowDiTExportWrapper(torch.nn.Module):
+    def __init__(self, model: TextToLatentRFDiT) -> None:
+        super().__init__()
+        self.model = model
+        self.use_speaker = model.cfg.use_speaker_condition_resolved
+        self.use_caption = model.cfg.use_caption_condition
+
+    def forward(
+        self,
+        x_t: torch.Tensor,
+        t: torch.Tensor,
+        delta_t: torch.Tensor,
+        text_state: torch.Tensor,
+        text_mask: torch.Tensor,
+        speaker_state: torch.Tensor,
+        speaker_mask: torch.Tensor,
+        caption_state: torch.Tensor,
+        caption_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        return self.model.forward_with_encoded_conditions(
+            x_t=x_t,
+            t=t,
+            delta_t=delta_t,
+            text_state=text_state,
+            text_mask=text_mask,
+            speaker_state=speaker_state if self.use_speaker else None,
+            speaker_mask=speaker_mask if self.use_speaker else None,
+            caption_state=caption_state if self.use_caption else None,
+            caption_mask=caption_mask if self.use_caption else None,
+            context_kv_cache=None,
+        )
+
+
+class OpenVINODiTBackend:
     def __init__(
         self,
         model: TextToLatentRFDiT,
@@ -68,6 +101,7 @@ class OpenVINORFDiTBackend:
             ) from exc
 
         self.model = model.eval()
+        self.is_meanflow = self.model.cfg.flow_parameterization == "meanflow"
         self.ov = ov
         self.device = str(device).strip().upper()
         self.core = ov.Core()
@@ -116,7 +150,8 @@ class OpenVINORFDiTBackend:
     def _ir_xml_path(self) -> Path:
         if self._ir_dir is None:
             raise RuntimeError("OpenVINO IR cache is not initialized.")
-        return self._ir_dir / "rf_dit.xml"
+        filename = "meanflow_dit.xml" if self.is_meanflow else "rf_dit.xml"
+        return self._ir_dir / filename
 
     @property
     def _ir_bin_path(self) -> Path:
@@ -136,7 +171,9 @@ class OpenVINORFDiTBackend:
         if self._ir_dir is None:
             return
         self._ir_dir.mkdir(parents=True, exist_ok=True)
-        tmp_xml = self._ir_dir / f"rf_dit.{os.getpid()}.tmp.xml"
+        tmp_xml = self._ir_xml_path.with_name(
+            f"{self._ir_xml_path.stem}.{os.getpid()}.tmp.xml"
+        )
         tmp_bin = tmp_xml.with_suffix(".bin")
         try:
             self.ov.save_model(ov_model, tmp_xml, compress_to_fp16=False)
@@ -150,7 +187,8 @@ class OpenVINORFDiTBackend:
                     pass
 
     def _supports_dynamic_ir(self, inputs: tuple[torch.Tensor, ...]) -> bool:
-        sequence_inputs = (inputs[0], inputs[2], inputs[4], inputs[6])
+        sequence_indexes = (0, 3, 5, 7) if self.is_meanflow else (0, 2, 4, 6)
+        sequence_inputs = tuple(inputs[index] for index in sequence_indexes)
         return all(
             tensor.shape[1] <= _MAX_DYNAMIC_SEQUENCE_LENGTH for tensor in sequence_inputs
         )
@@ -158,15 +196,18 @@ class OpenVINORFDiTBackend:
     def _dynamic_export_inputs(
         self, inputs: tuple[torch.Tensor, ...]
     ) -> tuple[torch.Tensor, ...]:
+        condition_sequences = (
+            True,
+            True,
+            bool(self.model.cfg.use_speaker_condition_resolved),
+            bool(self.model.cfg.use_speaker_condition_resolved),
+            bool(self.model.cfg.use_caption_condition),
+            bool(self.model.cfg.use_caption_condition),
+        )
         use_sequence = (
-            True,
-            False,
-            True,
-            True,
-            bool(self.model.cfg.use_speaker_condition_resolved),
-            bool(self.model.cfg.use_speaker_condition_resolved),
-            bool(self.model.cfg.use_caption_condition),
-            bool(self.model.cfg.use_caption_condition),
+            (True, False, False, *condition_sequences)
+            if self.is_meanflow
+            else (True, False, *condition_sequences)
         )
         example_inputs: list[torch.Tensor] = []
         for index, (tensor, dynamic_sequence) in enumerate(zip(inputs, use_sequence, strict=True)):
@@ -178,13 +219,13 @@ class OpenVINORFDiTBackend:
                 example = torch.ones(shape, dtype=tensor.dtype, device=tensor.device)
             else:
                 example = torch.zeros(shape, dtype=tensor.dtype, device=tensor.device)
-            if index == 1:
+            if index == 1 or (self.is_meanflow and index == 2):
                 example.fill_(0.5)
             example_inputs.append(example)
         return tuple(example_inputs)
 
     def _export_dynamic_ir(self, inputs: tuple[torch.Tensor, ...]):
-        wrapper = _RFDiTExportWrapper(self.model).eval()
+        wrapper = self._export_wrapper()
         export_inputs = self._dynamic_export_inputs(inputs)
         batch = torch.export.Dim("batch", min=1)
         latent = torch.export.Dim(
@@ -207,15 +248,23 @@ class OpenVINORFDiTBackend:
             if self.model.cfg.use_caption_condition
             else {0: batch}
         )
+        condition_shapes = (
+            {0: batch, 1: text},
+            {0: batch, 1: text},
+            speaker_shapes,
+            speaker_shapes,
+            caption_shapes,
+            caption_shapes,
+        )
         dynamic_shapes = (
             {0: batch, 1: latent},
             {0: batch},
-            {0: batch, 1: text},
-            {0: batch, 1: text},
-            speaker_shapes,
-            speaker_shapes,
-            caption_shapes,
-            caption_shapes,
+            {0: batch},
+            *condition_shapes,
+        ) if self.is_meanflow else (
+            {0: batch, 1: latent},
+            {0: batch},
+            *condition_shapes,
         )
 
         previous_rope_cache = self.model._freqs_cis_cache
@@ -258,6 +307,7 @@ class OpenVINORFDiTBackend:
         *,
         x_t: torch.Tensor,
         t: torch.Tensor,
+        delta_t: torch.Tensor | None,
         text_state: torch.Tensor,
         text_mask: torch.Tensor,
         speaker_state: torch.Tensor | None,
@@ -268,19 +318,17 @@ class OpenVINORFDiTBackend:
         batch = x_t.shape[0]
         if self.model.cfg.use_speaker_condition_resolved:
             if speaker_state is None or speaker_mask is None:
-                raise ValueError("Speaker state and mask are required by this RF-DiT model.")
+                raise ValueError("Speaker state and mask are required by this DiT model.")
         else:
             speaker_state = torch.empty((batch, 1, 1), dtype=x_t.dtype, device=x_t.device)
             speaker_mask = torch.zeros((batch, 1), dtype=torch.bool, device=x_t.device)
         if self.model.cfg.use_caption_condition:
             if caption_state is None or caption_mask is None:
-                raise ValueError("Caption state and mask are required by this RF-DiT model.")
+                raise ValueError("Caption state and mask are required by this DiT model.")
         else:
             caption_state = torch.empty((batch, 1, 1), dtype=x_t.dtype, device=x_t.device)
             caption_mask = torch.zeros((batch, 1), dtype=torch.bool, device=x_t.device)
-        return (
-            x_t,
-            t,
+        condition_inputs = (
             text_state,
             text_mask,
             speaker_state,
@@ -288,9 +336,25 @@ class OpenVINORFDiTBackend:
             caption_state,
             caption_mask,
         )
+        if self.is_meanflow:
+            if delta_t is None:
+                raise ValueError("delta_t is required by this MeanFlow DiT model.")
+            return (x_t, t, delta_t, *condition_inputs)
+        if delta_t is not None:
+            raise ValueError("delta_t is not supported by this RF DiT model.")
+        return (
+            x_t,
+            t,
+            *condition_inputs,
+        )
+
+    def _export_wrapper(self) -> torch.nn.Module:
+        if self.is_meanflow:
+            return _MeanFlowDiTExportWrapper(self.model).eval()
+        return _RFDiTExportWrapper(self.model).eval()
 
     def _convert_static(self, inputs: tuple[torch.Tensor, ...]):
-        wrapper = _RFDiTExportWrapper(self.model).eval()
+        wrapper = self._export_wrapper()
         with torch.inference_mode():
             exported = torch.export.export(wrapper, inputs)
         return self.ov.convert_model(exported)
@@ -332,11 +396,13 @@ class OpenVINORFDiTBackend:
         caption_state: torch.Tensor | None = None,
         caption_mask: torch.Tensor | None = None,
         context_kv_cache: list[tuple[torch.Tensor, ...]] | None = None,
+        delta_t: torch.Tensor | None = None,
     ) -> torch.Tensor:
         del context_kv_cache
         inputs = self._prepare_inputs(
             x_t=x_t,
             t=t,
+            delta_t=delta_t,
             text_state=text_state,
             text_mask=text_mask,
             speaker_state=speaker_state,
@@ -353,13 +419,13 @@ class OpenVINORFDiTBackend:
         return torch.from_numpy(output.copy()).to(device=x_t.device, dtype=x_t.dtype)
 
 
-def create_rf_dit_backend(
+def create_dit_backend(
     model: TextToLatentRFDiT,
     *,
     device: str,
     checkpoint_path: str | Path,
-) -> RFVelocityFn:
-    return OpenVINORFDiTBackend(
+) -> Callable[..., torch.Tensor]:
+    return OpenVINODiTBackend(
         model,
         device=device,
         checkpoint_path=checkpoint_path,
