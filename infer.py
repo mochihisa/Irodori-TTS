@@ -103,7 +103,10 @@ def main() -> None:
     parser.add_argument(
         "--codec-device",
         default=default_runtime_device(),
-        help="Codec device for reference encode/decode (e.g. cuda, mps, cpu).",
+        help=(
+            "Codec target (e.g. cuda, xpu, mps, cpu, or experimental npu; "
+            "npu currently applies to decode only)."
+        ),
     )
     parser.add_argument(
         "--codec-precision",

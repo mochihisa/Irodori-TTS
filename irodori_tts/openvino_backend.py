@@ -28,7 +28,7 @@ class _OpenVINOBackendBase(ABC):
             import openvino as ov
         except ImportError as exc:
             raise RuntimeError(
-                "OpenVINO is required for model_device='npu'. Install the openvino package."
+                "OpenVINO is required for NPU inference. Install the openvino package."
             ) from exc
 
         self.ov = ov
@@ -241,6 +241,21 @@ class _MeanFlowDiTExportWrapper(torch.nn.Module):
             caption_mask=caption_mask if self.use_caption else None,
             context_kv_cache=None,
         )
+
+
+class _DACVAEDecoderExportWrapper(torch.nn.Module):
+    def __init__(self, model: torch.nn.Module) -> None:
+        super().__init__()
+        self.out_proj = model.quantizer.out_proj
+        self.decoder_layers = model.decoder.model
+        # DACVAECodec uses forward_no_conv(), whose temporary module mutation is not exportable.
+        self.output_layers = model.decoder.wm_model.encoder_block.pre[:-1]
+
+    def forward(self, latent: torch.Tensor) -> torch.Tensor:
+        x = self.out_proj(latent)
+        for layer in self.decoder_layers:
+            x = layer(x)
+        return self.output_layers(x)
 
 
 class OpenVINODiTBackend(_OpenVINOBackendBase):
@@ -525,6 +540,61 @@ class OpenVINOPretrainedTextBackboneBackend(_OpenVINOBackendBase):
         return torch.from_numpy(output.copy()).to(device=input_ids.device, dtype=self.dtype)
 
 
+class OpenVINODACVAEDecoderBackend(_OpenVINOBackendBase):
+    def __init__(
+        self,
+        model: torch.nn.Module,
+        *,
+        device: str,
+        checkpoint_path: str | Path,
+    ) -> None:
+        self.model = model.eval()
+        self.wrapper = _DACVAEDecoderExportWrapper(self.model).eval()
+        self.dtype = next(self.model.parameters()).dtype
+        super().__init__(device=device, checkpoint_path=checkpoint_path)
+
+    @property
+    def _ir_filename(self) -> str:
+        return "dacvae_decoder.xml"
+
+    def _supports_dynamic_ir(self, inputs: tuple[torch.Tensor, ...]) -> bool:
+        return inputs[0].shape[2] <= _MAX_DYNAMIC_SEQUENCE_LENGTH
+
+    def _export_dynamic_ir(self, inputs: tuple[torch.Tensor, ...]):
+        latent = inputs[0]
+        export_input = torch.zeros(
+            (2, latent.shape[1], max(2, latent.shape[2])),
+            dtype=latent.dtype,
+            device=latent.device,
+        )
+        batch = torch.export.Dim("batch", min=1)
+        sequence = torch.export.Dim(
+            "latent",
+            min=1,
+            max=_MAX_DYNAMIC_SEQUENCE_LENGTH,
+        )
+        with torch.inference_mode():
+            exported = torch.export.export(
+                self.wrapper,
+                (export_input,),
+                dynamic_shapes=({0: batch, 2: sequence},),
+            )
+        return self.ov.convert_model(exported)
+
+    def _convert_static(self, inputs: tuple[torch.Tensor, ...]):
+        with torch.inference_mode():
+            exported = torch.export.export(self.wrapper, inputs)
+        return self.ov.convert_model(exported)
+
+    def __call__(self, latent: torch.Tensor) -> torch.Tensor:
+        if latent.ndim != 3:
+            raise ValueError(f"Expected latent ndim=3, got shape={tuple(latent.shape)}")
+        z = latent.transpose(1, 2).contiguous().to(device="cpu", dtype=self.dtype)
+        compiled_model = self._get_compiled_model((z,))
+        output = compiled_model((z,))[0]
+        return torch.from_numpy(output.copy())
+
+
 def create_dit_backend(
     model: TextToLatentRFDiT,
     *,
@@ -545,6 +615,19 @@ def create_pretrained_text_backbone_backend(
     checkpoint_path: str | Path,
 ) -> Callable[[torch.Tensor, torch.Tensor], torch.Tensor]:
     return OpenVINOPretrainedTextBackboneBackend(
+        model,
+        device=device,
+        checkpoint_path=checkpoint_path,
+    )
+
+
+def create_dacvae_decoder_backend(
+    model: torch.nn.Module,
+    *,
+    device: str,
+    checkpoint_path: str | Path,
+) -> Callable[[torch.Tensor], torch.Tensor]:
+    return OpenVINODACVAEDecoderBackend(
         model,
         device=device,
         checkpoint_path=checkpoint_path,

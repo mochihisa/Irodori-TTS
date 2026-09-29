@@ -39,6 +39,7 @@ from .tokenizer import PretrainedTextTokenizer
 from .watermark import SilentCipherWatermarker
 
 PretrainedBackboneFn = Callable[[torch.Tensor, torch.Tensor], torch.Tensor]
+CodecDecodeFn = Callable[[torch.Tensor], torch.Tensor]
 
 
 def _is_mps_available() -> bool:
@@ -80,12 +81,12 @@ def resolve_runtime_device(device: str | torch.device) -> torch.device:
     )
 
 
-def _is_npu_model_device(device: str | torch.device) -> bool:
+def _is_npu_device(device: str | torch.device) -> bool:
     return str(device).strip().lower() == "npu"
 
 
-def _resolve_model_device(device: str | torch.device) -> torch.device:
-    if _is_npu_model_device(device):
+def _resolve_torch_device(device: str | torch.device) -> torch.device:
+    if _is_npu_device(device):
         return torch.device("cpu")
     return resolve_runtime_device(device)
 
@@ -107,6 +108,8 @@ def default_runtime_device() -> str:
 
 
 def list_available_runtime_precisions(device: str | torch.device) -> list[str]:
+    if _is_npu_device(device):
+        return ["fp32"]
     resolved = resolve_runtime_device(device)
     if resolved.type in ("cuda", "xpu"):
         return ["fp32", "bf16"]
@@ -216,7 +219,7 @@ def _create_dit_forward_fn(
     model_device: str | torch.device,
     checkpoint_path: str | Path,
 ) -> Callable[..., torch.Tensor] | None:
-    if not _is_npu_model_device(model_device):
+    if not _is_npu_device(model_device):
         return None
     from .openvino_backend import create_dit_backend
 
@@ -233,7 +236,7 @@ def _create_pretrained_backbone_fn(
     model_device: str | torch.device,
     checkpoint_path: str | Path,
 ) -> PretrainedBackboneFn | None:
-    if not _is_npu_model_device(model_device) or model.pretrained_text_backbone is None:
+    if not _is_npu_device(model_device) or model.pretrained_text_backbone is None:
         return None
     from .openvino_backend import create_pretrained_text_backbone_backend
 
@@ -241,6 +244,22 @@ def _create_pretrained_backbone_fn(
         model,
         device="NPU",
         checkpoint_path=checkpoint_path,
+    )
+
+
+def _create_codec_decode_fn(
+    *,
+    codec: DACVAECodec,
+    codec_device: str | torch.device,
+) -> CodecDecodeFn | None:
+    if not _is_npu_device(codec_device):
+        return None
+    from .openvino_backend import create_dacvae_decoder_backend
+
+    return create_dacvae_decoder_backend(
+        codec.model,
+        device="NPU",
+        checkpoint_path=codec.checkpoint_path,
     )
 
 
@@ -651,17 +670,21 @@ class InferenceRuntime:
         default_max_ref_seconds: float = _LEGACY_MAX_REF_SECONDS,
         dit_forward_fn: Callable[..., torch.Tensor] | None = None,
         pretrained_backbone_fn: PretrainedBackboneFn | None = None,
+        codec_decode_fn: CodecDecodeFn | None = None,
     ) -> None:
         self.key = key
-        self.model_device = _resolve_model_device(key.model_device)
-        self.codec_device = resolve_runtime_device(key.codec_device)
-        if _is_npu_model_device(key.model_device) and dit_forward_fn is None:
+        self.model_device = _resolve_torch_device(key.model_device)
+        self.codec_device = _resolve_torch_device(key.codec_device)
+        if _is_npu_device(key.model_device) and dit_forward_fn is None:
             raise ValueError("model_device='npu' requires an OpenVINO DiT backend.")
+        if _is_npu_device(key.codec_device) and codec_decode_fn is None:
+            raise ValueError("codec_device='npu' requires an OpenVINO DACVAE decoder backend.")
         self.model_cfg = model_cfg
         self.train_cfg = train_cfg
         self.model = model
         self.dit_forward_fn = dit_forward_fn
         self.pretrained_backbone_fn = pretrained_backbone_fn
+        self.codec_decode_fn = codec_decode_fn
         self.tokenizer = tokenizer
         self.caption_tokenizer = caption_tokenizer
         self.codec = codec
@@ -675,11 +698,11 @@ class InferenceRuntime:
 
     @classmethod
     def from_key(cls, key: RuntimeKey) -> InferenceRuntime:
-        npu_model = _is_npu_model_device(key.model_device)
+        npu_model = _is_npu_device(key.model_device)
         if npu_model and key.compile_model:
             raise ValueError("model_device='npu' cannot be combined with compile_model.")
-        model_device = _resolve_model_device(key.model_device)
-        codec_device = resolve_runtime_device(key.codec_device)
+        model_device = _resolve_torch_device(key.model_device)
+        codec_device = _resolve_torch_device(key.codec_device)
         model_dtype = resolve_runtime_dtype(
             precision=key.model_precision,
             device=model_device,
@@ -791,6 +814,10 @@ class InferenceRuntime:
                 f"Latent dimension mismatch: checkpoint latent_dim={model_cfg.latent_dim} but codec latent_dim={codec.latent_dim}. "
                 "Use a compatible codec/checkpoint pair."
             )
+        codec_decode_fn = _create_codec_decode_fn(
+            codec=codec,
+            codec_device=key.codec_device,
+        )
 
         return cls(
             key=key,
@@ -805,6 +832,7 @@ class InferenceRuntime:
             default_max_ref_seconds=default_max_ref_seconds,
             dit_forward_fn=dit_forward_fn,
             pretrained_backbone_fn=pretrained_backbone_fn,
+            codec_decode_fn=codec_decode_fn,
         )
 
     def _resolve_lora_adapter_path(self, adapter_path: str | None) -> str | None:
@@ -1501,9 +1529,10 @@ class InferenceRuntime:
             z = z[:, :latent_steps]
 
             t0 = _measure_start(self.model_device, self.codec_device)
+            decode_latent = self.codec_decode_fn or self.codec.decode_latent
             trimmed_audios: list[torch.Tensor] = []
             if decode_mode == "batch":
-                audio_batch = self.codec.decode_latent(z).cpu()
+                audio_batch = decode_latent(z).cpu()
                 for i in range(num_candidates):
                     audio_i = audio_batch[i]
                     max_samples = target_samples
@@ -1522,7 +1551,7 @@ class InferenceRuntime:
                     trimmed_audios.append(audio_i[:, :max_samples])
             else:
                 for i in range(num_candidates):
-                    audio_i = self.codec.decode_latent(z[i : i + 1]).cpu()[0]
+                    audio_i = decode_latent(z[i : i + 1]).cpu()[0]
                     max_samples = target_samples
                     if bool(req.trim_tail):
                         flattening_point = find_flattening_point(
@@ -1575,6 +1604,7 @@ class InferenceRuntime:
     def unload(self) -> None:
         self.dit_forward_fn = None
         self.pretrained_backbone_fn = None
+        self.codec_decode_fn = None
         del self.model
         del self.tokenizer
         del self.codec

@@ -37,6 +37,7 @@ def unpatchify_latent(patched: torch.Tensor, patch_size: int, latent_dim: int) -
 @dataclass
 class DACVAECodec:
     model: torch.nn.Module
+    checkpoint_path: Path
     sample_rate: int
     latent_dim: int
     device: torch.device
@@ -105,6 +106,7 @@ class DACVAECodec:
             z = model.encode(dummy)  # (B, D, T)
         return cls(
             model=model,
+            checkpoint_path=Path(location),
             sample_rate=int(model.sample_rate),
             latent_dim=int(z.shape[1]),
             device=torch.device(device),
