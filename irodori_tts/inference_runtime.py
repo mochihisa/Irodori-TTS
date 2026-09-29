@@ -1291,6 +1291,22 @@ class InferenceRuntime:
                 _log(msg)
             _log(f"[runtime] prepare_reference: {stage_sec * 1000.0:.1f} ms")
 
+            t0 = _measure_start(self.model_device)
+            encoded_conditions = self.model.encode_conditions(
+                text_input_ids=text_ids,
+                text_mask=text_mask,
+                ref_latent=ref_latent,
+                ref_mask=ref_mask,
+                caption_input_ids=caption_ids,
+                caption_mask=caption_mask,
+                speaker_state_override=speaker_state_override,
+                speaker_mask_override=speaker_mask_override,
+                speaker_uncond_mode=req.speaker_uncond_mode,
+            )
+            stage_sec = _measure_end(self.model_device, t0)
+            stage_timings.append(("encode_conditions", stage_sec))
+            _log(f"[runtime] encode_conditions: {stage_sec * 1000.0:.1f} ms")
+
             hop_length = int(self.codec.model.hop_length)
             if manual_seconds is not None:
                 clamped_seconds = min(max_seconds, max(min_seconds, manual_seconds))
@@ -1328,17 +1344,7 @@ class InferenceRuntime:
                     _duration_speaker_mask,
                     _duration_caption_state,
                     _duration_caption_mask,
-                ) = self.model.encode_conditions(
-                    text_input_ids=text_ids,
-                    text_mask=text_mask,
-                    ref_latent=ref_latent,
-                    ref_mask=ref_mask,
-                    caption_input_ids=caption_ids,
-                    caption_mask=caption_mask,
-                    speaker_state_override=speaker_state_override,
-                    speaker_mask_override=speaker_mask_override,
-                    speaker_uncond_mode=req.speaker_uncond_mode,
-                )
+                ) = encoded_conditions
                 pred_log_frames = self.model.predict_duration_log_frames(
                     text_state=duration_text_state,
                     text_mask=duration_text_mask,
@@ -1411,6 +1417,7 @@ class InferenceRuntime:
                     seed=used_seed,
                     use_context_kv_cache=bool(req.context_kv_cache),
                     velocity_fn=self.dit_forward_fn,
+                    encoded_conditions=encoded_conditions,
                 )
             else:
                 z_patched = sample_euler_rf_cfg(
@@ -1443,6 +1450,7 @@ class InferenceRuntime:
                     t_schedule_mode=str(req.t_schedule_mode),
                     sway_coeff=float(req.sway_coeff),
                     velocity_fn=self.dit_forward_fn,
+                    encoded_conditions=encoded_conditions,
                 )
             stage_sec = _measure_end(self.model_device, t0)
             sample_stage = (

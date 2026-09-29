@@ -5,7 +5,7 @@ from collections.abc import Callable
 
 import torch
 
-from .model import TextToLatentRFDiT
+from .model import EncodedConditionTensors, TextToLatentRFDiT
 from .speaker_inversion import SPEAKER_INVERSION_UNCOND_MODES
 
 RFVelocityFn = Callable[..., torch.Tensor]
@@ -147,6 +147,7 @@ def sample_euler_rf_cfg(
     t_schedule_mode: str = "linear",
     sway_coeff: float = -1.0,
     velocity_fn: RFVelocityFn | None = None,
+    encoded_conditions: EncodedConditionTensors | None = None,
 ) -> torch.Tensor:
     """
     Euler sampling over RF ODE with text/reference/caption conditioning CFG.
@@ -216,6 +217,18 @@ def sample_euler_rf_cfg(
     use_joint_cfg = cfg_guidance_mode == "joint"
     use_alternating_cfg = cfg_guidance_mode == "alternating"
 
+    if encoded_conditions is None:
+        encoded_conditions = model.encode_conditions(
+            text_input_ids=text_input_ids,
+            text_mask=text_mask,
+            ref_latent=ref_latent,
+            ref_mask=ref_mask,
+            caption_input_ids=caption_input_ids,
+            caption_mask=caption_mask,
+            speaker_state_override=speaker_state_override,
+            speaker_mask_override=speaker_mask_override,
+            speaker_uncond_mode=speaker_uncond_mode,
+        )
     (
         text_state_cond,
         text_mask_cond,
@@ -223,17 +236,7 @@ def sample_euler_rf_cfg(
         speaker_mask_cond,
         caption_state_cond,
         caption_mask_cond,
-    ) = model.encode_conditions(
-        text_input_ids=text_input_ids,
-        text_mask=text_mask,
-        ref_latent=ref_latent,
-        ref_mask=ref_mask,
-        caption_input_ids=caption_input_ids,
-        caption_mask=caption_mask,
-        speaker_state_override=speaker_state_override,
-        speaker_mask_override=speaker_mask_override,
-        speaker_uncond_mode=speaker_uncond_mode,
-    )
+    ) = encoded_conditions
     text_state_uncond = torch.zeros_like(text_state_cond)
     text_mask_uncond = torch.zeros_like(text_mask_cond)
     speaker_state_uncond = None

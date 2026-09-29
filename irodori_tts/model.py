@@ -32,6 +32,14 @@ DURATION_ARCHITECTURES = {
     "token_sum_adarn_zero_no_aux",
     "token_sum_dual_adarn_zero_no_aux",
 }
+EncodedConditionTensors = tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor | None,
+    torch.Tensor | None,
+    torch.Tensor | None,
+    torch.Tensor | None,
+]
 
 
 def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0) -> torch.Tensor:
@@ -1778,14 +1786,7 @@ class TextToLatentRFDiT(nn.Module):
         text_condition_dropout: torch.Tensor | None = None,
         speaker_condition_dropout: torch.Tensor | None = None,
         caption_condition_dropout: torch.Tensor | None = None,
-    ) -> tuple[
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor | None,
-        torch.Tensor | None,
-        torch.Tensor | None,
-        torch.Tensor | None,
-    ]:
+    ) -> EncodedConditionTensors:
         if text_condition_dropout is not None:
             text_mask = text_mask.clone()
             text_mask[text_condition_dropout] = False
@@ -1997,15 +1998,7 @@ class TextToLatentRFDiT(nn.Module):
         duration_only: bool = False,
         duration_backprop_to_condition: bool = False,
         delta_t: torch.Tensor | None = None,
-        encoded_conditions: tuple[
-            torch.Tensor,
-            torch.Tensor,
-            torch.Tensor | None,
-            torch.Tensor | None,
-            torch.Tensor | None,
-            torch.Tensor | None,
-        ]
-        | None = None,
+        encoded_conditions: EncodedConditionTensors | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         if duration_features is not None and encoded_conditions is not None:
             raise ValueError("encoded_conditions is not supported by the duration path.")

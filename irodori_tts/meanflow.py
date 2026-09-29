@@ -5,7 +5,7 @@ from dataclasses import dataclass
 
 import torch
 
-from .model import TextToLatentRFDiT
+from .model import EncodedConditionTensors, TextToLatentRFDiT
 from .rf import _make_rng
 
 
@@ -506,6 +506,7 @@ def sample_euler_meanflow(
     seed: int = 0,
     use_context_kv_cache: bool = True,
     velocity_fn: Callable[..., torch.Tensor] | None = None,
+    encoded_conditions: EncodedConditionTensors | None = None,
 ) -> torch.Tensor:
     """Linear MeanFlow sampler from Irodori time 1 to 0 (default: 4 NFE)."""
     if str(model.cfg.flow_parameterization).strip().lower() != "meanflow":
@@ -526,8 +527,8 @@ def sample_euler_meanflow(
     if rng_device != device:
         x_t = x_t.to(device=device)
 
-    encoded = EncodedConditions(
-        *model.encode_conditions(
+    if encoded_conditions is None:
+        encoded_conditions = model.encode_conditions(
             text_input_ids=text_input_ids,
             text_mask=text_mask,
             ref_latent=ref_latent,
@@ -538,7 +539,7 @@ def sample_euler_meanflow(
             speaker_mask_override=speaker_mask_override,
             speaker_uncond_mode=speaker_uncond_mode,
         )
-    )
+    encoded = EncodedConditions(*encoded_conditions)
     context_kv_cache = None
     if use_context_kv_cache:
         context_kv_cache = model.build_context_kv_cache(
