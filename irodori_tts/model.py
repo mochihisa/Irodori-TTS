@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Callable
 from dataclasses import asdict
 
 import torch
@@ -865,7 +866,7 @@ class PretrainedConditionProjector(nn.Module):
 
     def forward(
         self,
-        backbone: PretrainedTextBackbone,
+        backbone: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
         input_ids: torch.Tensor,
         mask: torch.Tensor,
     ) -> torch.Tensor:
@@ -1786,6 +1787,8 @@ class TextToLatentRFDiT(nn.Module):
         text_condition_dropout: torch.Tensor | None = None,
         speaker_condition_dropout: torch.Tensor | None = None,
         caption_condition_dropout: torch.Tensor | None = None,
+        pretrained_backbone_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor]
+        | None = None,
     ) -> EncodedConditionTensors:
         if text_condition_dropout is not None:
             text_mask = text_mask.clone()
@@ -1822,10 +1825,18 @@ class TextToLatentRFDiT(nn.Module):
                 caption_mask = caption_mask.clone()
                 caption_mask[caption_condition_dropout] = False
 
-        if self.pretrained_text_backbone is None:
+        pretrained_backbone = self.pretrained_text_backbone
+        if pretrained_backbone_fn is not None:
+            if pretrained_backbone is None:
+                raise ValueError(
+                    "pretrained_backbone_fn requires text_encoder_type='pretrained'."
+                )
+            pretrained_backbone = pretrained_backbone_fn
+
+        if pretrained_backbone is None:
             text_state = self.text_encoder(text_input_ids, text_mask)
         else:
-            text_state = self.text_encoder(self.pretrained_text_backbone, text_input_ids, text_mask)
+            text_state = self.text_encoder(pretrained_backbone, text_input_ids, text_mask)
         text_state = self.text_norm(text_state)
         ref_state = None
         if self.cfg.use_speaker_condition_resolved:
@@ -1865,11 +1876,11 @@ class TextToLatentRFDiT(nn.Module):
             )
         caption_state = None
         if self.cfg.use_caption_condition:
-            if self.pretrained_text_backbone is None:
+            if pretrained_backbone is None:
                 caption_state = self.caption_encoder(caption_input_ids, caption_mask)
             else:
                 caption_state = self.caption_encoder(
-                    self.pretrained_text_backbone, caption_input_ids, caption_mask
+                    pretrained_backbone, caption_input_ids, caption_mask
                 )
             caption_state = self.caption_norm(caption_state)
         return text_state, text_mask, ref_state, ref_mask, caption_state, caption_mask

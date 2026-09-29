@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import warnings
+from abc import ABC, abstractmethod
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -19,6 +20,163 @@ def _safe_cache_component(value: object) -> str:
         char if char.isalnum() or char in {"-", ".", "+", "_"} else "_"
         for char in str(value)
     )
+
+
+class _OpenVINOBackendBase(ABC):
+    def __init__(self, *, device: str, checkpoint_path: str | Path) -> None:
+        try:
+            import openvino as ov
+        except ImportError as exc:
+            raise RuntimeError(
+                "OpenVINO is required for model_device='npu'. Install the openvino package."
+            ) from exc
+
+        self.ov = ov
+        self.device = str(device).strip().upper()
+        self.core = ov.Core()
+        if self.device not in self.core.available_devices:
+            available = ", ".join(self.core.available_devices) or "none"
+            raise RuntimeError(
+                f"OpenVINO device {self.device!r} is unavailable. Available devices: {available}."
+            )
+        self._ir_dir: Path | None = None
+        self._ir_model = None
+        self._dynamic_ir_unavailable = False
+        self._compiled_models: dict[
+            tuple[tuple[tuple[int, ...], torch.dtype], ...], Any
+        ] = {}
+        self._initialize_cache(Path(checkpoint_path))
+
+    @property
+    @abstractmethod
+    def _ir_filename(self) -> str:
+        raise NotImplementedError
+
+    @abstractmethod
+    def _supports_dynamic_ir(self, inputs: tuple[torch.Tensor, ...]) -> bool:
+        raise NotImplementedError
+
+    @abstractmethod
+    def _export_dynamic_ir(self, inputs: tuple[torch.Tensor, ...]):
+        raise NotImplementedError
+
+    @abstractmethod
+    def _convert_static(self, inputs: tuple[torch.Tensor, ...]):
+        raise NotImplementedError
+
+    @property
+    def _ir_xml_path(self) -> Path:
+        if self._ir_dir is None:
+            raise RuntimeError("OpenVINO IR cache is not initialized.")
+        return self._ir_dir / self._ir_filename
+
+    def _initialize_cache(self, checkpoint_path: Path) -> None:
+        try:
+            checkpoint_path = checkpoint_path.expanduser()
+            checkpoint_stat = checkpoint_path.stat()
+            cache_root = checkpoint_path.with_name(f"{checkpoint_path.name}.openvino")
+            torch_version = _safe_cache_component(torch.__version__)
+            openvino_version = _safe_cache_component(self.ov.__version__)
+            cache_key = (
+                f"v{_IR_CACHE_VERSION}"
+                f"-size{checkpoint_stat.st_size}"
+                f"-mtime{checkpoint_stat.st_mtime_ns}"
+                f"-torch{torch_version}"
+                f"-ov{openvino_version}"
+            )
+            self._ir_dir = cache_root / cache_key
+            compiled_dir = self._ir_dir / "compiled"
+            compiled_dir.mkdir(parents=True, exist_ok=True)
+            self.core.set_property(
+                self.device,
+                {self.ov.properties.cache_dir(): str(compiled_dir)},
+            )
+        except (OSError, RuntimeError) as exc:
+            warnings.warn(
+                f"Could not initialize OpenVINO cache next to {checkpoint_path}: {exc}",
+                stacklevel=2,
+            )
+            self._ir_dir = None
+
+    def _load_cached_ir_file(self, path: Path):
+        try:
+            if not path.is_file():
+                return None
+            return self.core.read_model(path)
+        except (OSError, RuntimeError):
+            return None
+
+    def _save_ir_file(self, ov_model, path: Path) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_xml = path.with_name(f"{path.stem}.{os.getpid()}.tmp.xml")
+        tmp_bin = tmp_xml.with_suffix(".bin")
+        try:
+            self.ov.save_model(ov_model, tmp_xml, compress_to_fp16=False)
+            tmp_bin.replace(path.with_suffix(".bin"))
+            tmp_xml.replace(path)
+        finally:
+            for tmp_path in (tmp_xml, tmp_bin):
+                try:
+                    tmp_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+
+    def _get_dynamic_ir(self, inputs: tuple[torch.Tensor, ...]):
+        if self._ir_model is not None:
+            return self._ir_model
+        if self._ir_dir is None:
+            raise RuntimeError("OpenVINO IR cache is not initialized.")
+
+        path = self._ir_xml_path
+        cached = self._load_cached_ir_file(path)
+        if cached is not None:
+            self._ir_model = cached
+            return cached
+
+        model = self._export_dynamic_ir(inputs)
+        try:
+            self._save_ir_file(model, path)
+        except (OSError, RuntimeError) as exc:
+            warnings.warn(f"Could not save OpenVINO IR cache: {exc}", stacklevel=2)
+        else:
+            cached = self._load_cached_ir_file(path)
+            if cached is not None:
+                model = cached
+        self._ir_model = model
+        return model
+
+    def _compile(self, inputs: tuple[torch.Tensor, ...]):
+        if (
+            self._ir_dir is not None
+            and not self._dynamic_ir_unavailable
+            and self._supports_dynamic_ir(inputs)
+        ):
+            try:
+                ov_model = self._get_dynamic_ir(inputs).clone()
+            except Exception as exc:
+                warnings.warn(
+                    f"Dynamic OpenVINO IR export failed; using a static graph: {exc}",
+                    stacklevel=2,
+                )
+                self._dynamic_ir_unavailable = True
+                ov_model = self._convert_static(inputs)
+        else:
+            ov_model = self._convert_static(inputs)
+        ov_model.reshape(
+            {
+                port.any_name: list(tensor.shape)
+                for port, tensor in zip(ov_model.inputs, inputs, strict=True)
+            }
+        )
+        return self.core.compile_model(ov_model, self.device)
+
+    def _get_compiled_model(self, inputs: tuple[torch.Tensor, ...]):
+        signature = tuple((tuple(tensor.shape), tensor.dtype) for tensor in inputs)
+        compiled_model = self._compiled_models.get(signature)
+        if compiled_model is None:
+            compiled_model = self._compile(inputs)
+            self._compiled_models[signature] = compiled_model
+        return compiled_model
 
 
 class _RFDiTExportWrapper(torch.nn.Module):
@@ -85,7 +243,7 @@ class _MeanFlowDiTExportWrapper(torch.nn.Module):
         )
 
 
-class OpenVINODiTBackend:
+class OpenVINODiTBackend(_OpenVINOBackendBase):
     def __init__(
         self,
         model: TextToLatentRFDiT,
@@ -93,98 +251,13 @@ class OpenVINODiTBackend:
         device: str,
         checkpoint_path: str | Path,
     ) -> None:
-        try:
-            import openvino as ov
-        except ImportError as exc:
-            raise RuntimeError(
-                "OpenVINO is required for model_device='npu'. Install the openvino package."
-            ) from exc
-
         self.model = model.eval()
         self.is_meanflow = self.model.cfg.flow_parameterization == "meanflow"
-        self.ov = ov
-        self.device = str(device).strip().upper()
-        self.core = ov.Core()
-        if self.device not in self.core.available_devices:
-            available = ", ".join(self.core.available_devices) or "none"
-            raise RuntimeError(
-                f"OpenVINO device {self.device!r} is unavailable. Available devices: {available}."
-            )
-        self._ir_model = None
-        self._dynamic_ir_unavailable = False
-        self._ir_dir: Path | None = None
-        self._initialize_cache(Path(checkpoint_path))
-        self._compiled_models: dict[
-            tuple[tuple[tuple[int, ...], torch.dtype], ...], Any
-        ] = {}
-
-    def _initialize_cache(self, checkpoint_path: Path) -> None:
-        try:
-            checkpoint_path = checkpoint_path.expanduser()
-            checkpoint_stat = checkpoint_path.stat()
-            cache_root = checkpoint_path.with_name(f"{checkpoint_path.name}.openvino")
-            torch_version = _safe_cache_component(torch.__version__)
-            openvino_version = _safe_cache_component(self.ov.__version__)
-            cache_key = (
-                f"v{_IR_CACHE_VERSION}"
-                f"-size{checkpoint_stat.st_size}"
-                f"-mtime{checkpoint_stat.st_mtime_ns}"
-                f"-torch{torch_version}"
-                f"-ov{openvino_version}"
-            )
-            self._ir_dir = cache_root / cache_key
-            compiled_dir = self._ir_dir / "compiled"
-            compiled_dir.mkdir(parents=True, exist_ok=True)
-            self.core.set_property(
-                self.device,
-                {self.ov.properties.cache_dir(): str(compiled_dir)},
-            )
-        except (OSError, RuntimeError) as exc:
-            warnings.warn(
-                f"Could not initialize OpenVINO cache next to {checkpoint_path}: {exc}",
-                stacklevel=2,
-            )
-            self._ir_dir = None
+        super().__init__(device=device, checkpoint_path=checkpoint_path)
 
     @property
-    def _ir_xml_path(self) -> Path:
-        if self._ir_dir is None:
-            raise RuntimeError("OpenVINO IR cache is not initialized.")
-        filename = "meanflow_dit.xml" if self.is_meanflow else "rf_dit.xml"
-        return self._ir_dir / filename
-
-    @property
-    def _ir_bin_path(self) -> Path:
-        return self._ir_xml_path.with_suffix(".bin")
-
-    def _load_cached_ir(self):
-        if self._ir_dir is None:
-            return None
-        try:
-            if not self._ir_xml_path.is_file():
-                return None
-            return self.core.read_model(self._ir_xml_path)
-        except (OSError, RuntimeError):
-            return None
-
-    def _save_ir(self, ov_model) -> None:
-        if self._ir_dir is None:
-            return
-        self._ir_dir.mkdir(parents=True, exist_ok=True)
-        tmp_xml = self._ir_xml_path.with_name(
-            f"{self._ir_xml_path.stem}.{os.getpid()}.tmp.xml"
-        )
-        tmp_bin = tmp_xml.with_suffix(".bin")
-        try:
-            self.ov.save_model(ov_model, tmp_xml, compress_to_fp16=False)
-            tmp_bin.replace(self._ir_bin_path)
-            tmp_xml.replace(self._ir_xml_path)
-        finally:
-            for tmp_path in (tmp_xml, tmp_bin):
-                try:
-                    tmp_path.unlink(missing_ok=True)
-                except OSError:
-                    pass
+    def _ir_filename(self) -> str:
+        return "meanflow_dit.xml" if self.is_meanflow else "rf_dit.xml"
 
     def _supports_dynamic_ir(self, inputs: tuple[torch.Tensor, ...]) -> bool:
         sequence_indexes = (0, 3, 5, 7) if self.is_meanflow else (0, 2, 4, 6)
@@ -283,25 +356,6 @@ class OpenVINODiTBackend:
             self.model._freqs_cis_cache = previous_rope_cache
         return self.ov.convert_model(exported)
 
-    def _get_dynamic_ir(self, inputs: tuple[torch.Tensor, ...]):
-        if self._ir_model is not None:
-            return self._ir_model
-        cached = self._load_cached_ir()
-        if cached is not None:
-            self._ir_model = cached
-            return cached
-        model = self._export_dynamic_ir(inputs)
-        try:
-            self._save_ir(model)
-        except (OSError, RuntimeError) as exc:
-            warnings.warn(f"Could not save OpenVINO IR cache: {exc}", stacklevel=2)
-        else:
-            cached = self._load_cached_ir()
-            if cached is not None:
-                model = cached
-        self._ir_model = model
-        return model
-
     def _prepare_inputs(
         self,
         *,
@@ -359,31 +413,6 @@ class OpenVINODiTBackend:
             exported = torch.export.export(wrapper, inputs)
         return self.ov.convert_model(exported)
 
-    def _compile(self, inputs: tuple[torch.Tensor, ...]):
-        if (
-            self._ir_dir is not None
-            and not self._dynamic_ir_unavailable
-            and self._supports_dynamic_ir(inputs)
-        ):
-            try:
-                ov_model = self._get_dynamic_ir(inputs).clone()
-            except Exception as exc:
-                warnings.warn(
-                    f"Dynamic OpenVINO IR export failed; using a static graph: {exc}",
-                    stacklevel=2,
-                )
-                self._dynamic_ir_unavailable = True
-                ov_model = self._convert_static(inputs)
-        else:
-            ov_model = self._convert_static(inputs)
-        ov_model.reshape(
-            {
-                port.any_name: list(tensor.shape)
-                for port, tensor in zip(ov_model.inputs, inputs, strict=True)
-            }
-        )
-        return self.core.compile_model(ov_model, self.device)
-
     def __call__(
         self,
         *,
@@ -410,13 +439,90 @@ class OpenVINODiTBackend:
             caption_state=caption_state,
             caption_mask=caption_mask,
         )
-        signature = tuple((tuple(tensor.shape), tensor.dtype) for tensor in inputs)
-        compiled_model = self._compiled_models.get(signature)
-        if compiled_model is None:
-            compiled_model = self._compile(inputs)
-            self._compiled_models[signature] = compiled_model
+        compiled_model = self._get_compiled_model(inputs)
         output = compiled_model(inputs)[0]
         return torch.from_numpy(output.copy()).to(device=x_t.device, dtype=x_t.dtype)
+
+
+class OpenVINOPretrainedTextBackboneBackend(_OpenVINOBackendBase):
+    def __init__(
+        self,
+        model: TextToLatentRFDiT,
+        *,
+        device: str,
+        checkpoint_path: str | Path,
+    ) -> None:
+        backbone = model.pretrained_text_backbone
+        if backbone is None:
+            raise ValueError(
+                "OpenVINO pretrained text backbone requires text_encoder_type='pretrained'."
+            )
+        self.backbone = backbone.eval()
+        self.dtype = next(self.backbone.parameters()).dtype
+        super().__init__(device=device, checkpoint_path=checkpoint_path)
+
+    @property
+    def _ir_filename(self) -> str:
+        return "pretrained_text_backbone.xml"
+
+    def _supports_dynamic_ir(self, inputs: tuple[torch.Tensor, ...]) -> bool:
+        return inputs[0].shape[1] <= _MAX_DYNAMIC_SEQUENCE_LENGTH
+
+    def _dynamic_export_inputs(
+        self,
+        inputs: tuple[torch.Tensor, torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        input_ids, mask = inputs
+        shape = (2, max(2, input_ids.shape[1]))
+        return (
+            torch.zeros(shape, dtype=input_ids.dtype, device=input_ids.device),
+            torch.ones(shape, dtype=mask.dtype, device=mask.device),
+        )
+
+    def _export_dynamic_ir(self, inputs: tuple[torch.Tensor, torch.Tensor]):
+        export_inputs = self._dynamic_export_inputs(inputs)
+        batch = torch.export.Dim("batch", min=1)
+        sequence = torch.export.Dim(
+            "sequence",
+            min=1,
+            max=_MAX_DYNAMIC_SEQUENCE_LENGTH,
+        )
+        dynamic_shapes = (
+            {0: batch, 1: sequence},
+            {0: batch, 1: sequence},
+        )
+        with torch.inference_mode():
+            exported = torch.export.export(
+                self.backbone,
+                export_inputs,
+                dynamic_shapes=dynamic_shapes,
+            )
+        return self.ov.convert_model(exported)
+
+    def _convert_static(self, inputs: tuple[torch.Tensor, torch.Tensor]):
+        with torch.inference_mode():
+            exported = torch.export.export(self.backbone, inputs)
+        return self.ov.convert_model(exported)
+
+    def __call__(
+        self,
+        input_ids: torch.Tensor,
+        mask: torch.Tensor,
+    ) -> torch.Tensor:
+        if input_ids.ndim != 2 or mask.ndim != 2:
+            raise ValueError(
+                "Pretrained text backbone inputs must have shape (B,S): "
+                f"input_ids={tuple(input_ids.shape)} mask={tuple(mask.shape)}"
+            )
+        if input_ids.shape != mask.shape:
+            raise ValueError(
+                "Pretrained text backbone input shape mismatch: "
+                f"input_ids={tuple(input_ids.shape)} mask={tuple(mask.shape)}"
+            )
+        inputs = (input_ids, mask)
+        compiled_model = self._get_compiled_model(inputs)
+        output = compiled_model(inputs)[0]
+        return torch.from_numpy(output.copy()).to(device=input_ids.device, dtype=self.dtype)
 
 
 def create_dit_backend(
@@ -426,6 +532,19 @@ def create_dit_backend(
     checkpoint_path: str | Path,
 ) -> Callable[..., torch.Tensor]:
     return OpenVINODiTBackend(
+        model,
+        device=device,
+        checkpoint_path=checkpoint_path,
+    )
+
+
+def create_pretrained_text_backbone_backend(
+    model: TextToLatentRFDiT,
+    *,
+    device: str,
+    checkpoint_path: str | Path,
+) -> Callable[[torch.Tensor, torch.Tensor], torch.Tensor]:
+    return OpenVINOPretrainedTextBackboneBackend(
         model,
         device=device,
         checkpoint_path=checkpoint_path,

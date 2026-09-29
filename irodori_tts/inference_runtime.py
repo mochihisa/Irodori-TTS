@@ -38,6 +38,8 @@ from .text_normalization import normalize_text
 from .tokenizer import PretrainedTextTokenizer
 from .watermark import SilentCipherWatermarker
 
+PretrainedBackboneFn = Callable[[torch.Tensor, torch.Tensor], torch.Tensor]
+
 
 def _is_mps_available() -> bool:
     backends = getattr(torch, "backends", None)
@@ -219,6 +221,23 @@ def _create_dit_forward_fn(
     from .openvino_backend import create_dit_backend
 
     return create_dit_backend(
+        model,
+        device="NPU",
+        checkpoint_path=checkpoint_path,
+    )
+
+
+def _create_pretrained_backbone_fn(
+    *,
+    model: TextToLatentRFDiT,
+    model_device: str | torch.device,
+    checkpoint_path: str | Path,
+) -> PretrainedBackboneFn | None:
+    if not _is_npu_model_device(model_device) or model.pretrained_text_backbone is None:
+        return None
+    from .openvino_backend import create_pretrained_text_backbone_backend
+
+    return create_pretrained_text_backbone_backend(
         model,
         device="NPU",
         checkpoint_path=checkpoint_path,
@@ -631,6 +650,7 @@ class InferenceRuntime:
         default_caption_max_len: int,
         default_max_ref_seconds: float = _LEGACY_MAX_REF_SECONDS,
         dit_forward_fn: Callable[..., torch.Tensor] | None = None,
+        pretrained_backbone_fn: PretrainedBackboneFn | None = None,
     ) -> None:
         self.key = key
         self.model_device = _resolve_model_device(key.model_device)
@@ -641,6 +661,7 @@ class InferenceRuntime:
         self.train_cfg = train_cfg
         self.model = model
         self.dit_forward_fn = dit_forward_fn
+        self.pretrained_backbone_fn = pretrained_backbone_fn
         self.tokenizer = tokenizer
         self.caption_tokenizer = caption_tokenizer
         self.codec = codec
@@ -696,6 +717,11 @@ class InferenceRuntime:
             dynamic=bool(key.compile_dynamic),
         )
         dit_forward_fn = _create_dit_forward_fn(
+            model=model,
+            model_device=key.model_device,
+            checkpoint_path=checkpoint_path,
+        )
+        pretrained_backbone_fn = _create_pretrained_backbone_fn(
             model=model,
             model_device=key.model_device,
             checkpoint_path=checkpoint_path,
@@ -778,6 +804,7 @@ class InferenceRuntime:
             default_caption_max_len=default_caption_max_len,
             default_max_ref_seconds=default_max_ref_seconds,
             dit_forward_fn=dit_forward_fn,
+            pretrained_backbone_fn=pretrained_backbone_fn,
         )
 
     def _resolve_lora_adapter_path(self, adapter_path: str | None) -> str | None:
@@ -1302,6 +1329,7 @@ class InferenceRuntime:
                 speaker_state_override=speaker_state_override,
                 speaker_mask_override=speaker_mask_override,
                 speaker_uncond_mode=req.speaker_uncond_mode,
+                pretrained_backbone_fn=self.pretrained_backbone_fn,
             )
             stage_sec = _measure_end(self.model_device, t0)
             stage_timings.append(("encode_conditions", stage_sec))
@@ -1546,6 +1574,7 @@ class InferenceRuntime:
 
     def unload(self) -> None:
         self.dit_forward_fn = None
+        self.pretrained_backbone_fn = None
         del self.model
         del self.tokenizer
         del self.codec
