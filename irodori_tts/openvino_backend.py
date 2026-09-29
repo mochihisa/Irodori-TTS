@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import os
 import warnings
 from abc import ABC, abstractmethod
@@ -20,6 +21,61 @@ def _safe_cache_component(value: object) -> str:
         char if char.isalnum() or char in {"-", ".", "+", "_"} else "_"
         for char in str(value)
     )
+
+
+def _replace_squared_sine_with_polynomial(ov: Any, model: Any) -> None:
+    constants_by_type: dict[str, tuple[Any, ...]] = {}
+    sin_nodes = [node for node in model.get_ops() if node.get_type_name() == "Sin"]
+
+    for sin_node in sin_nodes:
+        consumers = list(sin_node.output(0).get_target_inputs())
+        if len(consumers) != 1 or consumers[0].get_node().get_type_name() != "Power":
+            raise RuntimeError("DACVAE decoder Sin must be consumed by a single Power operation.")
+        power_node = consumers[0].get_node()
+        exponent = power_node.input_value(1).get_node()
+        if exponent.get_type_name() != "Constant" or exponent.get_vector() != [2.0]:
+            raise RuntimeError("DACVAE decoder Sin must be squared by a constant exponent of 2.")
+
+        value = sin_node.input_value(0)
+        element_type = value.get_element_type()
+        type_name = element_type.get_type_name()
+        constants = constants_by_type.get(type_name)
+        if constants is None:
+            # Reduce by the pi-period of sin^2, then evaluate its degree-12 Taylor series.
+            coefficients = (
+                1.0 / math.pi,
+                0.5,
+                math.pi,
+                -2.0 / 467775.0,
+                2.0 / 14175.0,
+                -1.0 / 315.0,
+                2.0 / 45.0,
+                -1.0 / 3.0,
+                1.0,
+            )
+            constants = tuple(
+                ov.opset13.constant(coefficient, element_type) for coefficient in coefficients
+            )
+            constants_by_type[type_name] = constants
+        inv_pi, half, pi, *polynomial_coefficients = constants
+
+        periods = ov.opset13.floor(
+            ov.opset13.add(ov.opset13.multiply(value, inv_pi), half)
+        )
+        reduced = ov.opset13.subtract(value, ov.opset13.multiply(periods, pi))
+        squared = ov.opset13.multiply(reduced, reduced)
+        polynomial = polynomial_coefficients[0]
+        for coefficient in polynomial_coefficients[1:]:
+            polynomial = ov.opset13.add(
+                coefficient,
+                ov.opset13.multiply(squared, polynomial),
+            )
+        approximation = ov.opset13.multiply(squared, polynomial)
+        approximation.set_friendly_name(power_node.get_friendly_name())
+        approximation.output(0).set_names(power_node.output(0).get_names())
+        power_node.output(0).replace(approximation.output(0))
+
+    model.validate_nodes_and_infer_types()
 
 
 class _OpenVINOBackendBase(ABC):
@@ -555,7 +611,12 @@ class OpenVINODACVAEDecoderBackend(_OpenVINOBackendBase):
 
     @property
     def _ir_filename(self) -> str:
-        return "dacvae_decoder.xml"
+        return "dacvae_decoder_poly.xml"
+
+    def _convert_exported(self, exported: torch.export.ExportedProgram):
+        model = self.ov.convert_model(exported)
+        _replace_squared_sine_with_polynomial(self.ov, model)
+        return model
 
     def _supports_dynamic_ir(self, inputs: tuple[torch.Tensor, ...]) -> bool:
         return inputs[0].shape[2] <= _MAX_DYNAMIC_SEQUENCE_LENGTH
@@ -579,12 +640,12 @@ class OpenVINODACVAEDecoderBackend(_OpenVINOBackendBase):
                 (export_input,),
                 dynamic_shapes=({0: batch, 2: sequence},),
             )
-        return self.ov.convert_model(exported)
+        return self._convert_exported(exported)
 
     def _convert_static(self, inputs: tuple[torch.Tensor, ...]):
         with torch.inference_mode():
             exported = torch.export.export(self.wrapper, inputs)
-        return self.ov.convert_model(exported)
+        return self._convert_exported(exported)
 
     def __call__(self, latent: torch.Tensor) -> torch.Tensor:
         if latent.ndim != 3:
